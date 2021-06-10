@@ -1,0 +1,271 @@
+---
+title: "Bank XgBoost"
+author: "Andrew vanderWilden"
+date: "6/9/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = T, message = T, comment = NA)
+```
+
+```{r, warning = FALSE, message=FALSE}
+library(tidyverse)
+library(tidymodels)
+
+tidymodels_prefer()
+```
+
+```{r}
+df <- as_tibble(read.csv('UniversalBank.csv'))
+```
+
+
+```{r}
+# Light Wrangling
+
+df <- df %>%
+  mutate(
+    Personal.Loan = as_factor(ifelse(Personal.Loan == 1, 'Yes', 'No')),
+    Education = ifelse(Education == 1, 'Undergrad',
+                       ifelse(Education == 2, 'Graduate', 'Phd')),
+    Securities.Account = as_factor(Securities.Account),
+    CD.Account = as_factor(CD.Account),
+    Online = as_factor(Online),
+    CreditCard = as_factor(CreditCard),
+    ZIP.Code = as_factor(ZIP.Code)
+  ) %>%
+  select(-ID) %>%
+  relocate(Personal.Loan)
+
+```
+
+
+```{r}
+# Train Test Split
+
+set.seed(19377)
+
+df_split <- initial_split(df, strata = Personal.Loan)
+
+df_train <- training(df_split)
+
+df_test <- testing(df_split)
+```
+
+
+```{r}
+xgb_spec <- boost_tree(
+  trees = 500,
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry = tune(),
+  learn_rate = tune()
+) %>%
+  set_engine('xgboost') %>%
+  set_mode('classification')
+
+xgb_spec
+```
+
+
+```{r}
+# XGB Grid
+
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), df_train),
+  learn_rate(),
+  size = 20
+)
+
+xgb_grid
+```
+
+
+```{r}
+# Create Workflow
+
+xgb_wf <- workflow() %>%
+  add_formula(Personal.Loan~.) %>%
+  add_model(xgb_spec)
+
+xgb_wf
+```
+
+
+```{r}
+# Create bootstrap samples for tuning
+
+set.seed(836618)
+
+df_bs <- bootstraps(df_train, strata = Personal.Loan)
+```
+
+
+```{r}
+# tune the model
+
+set.seed(28927)
+
+doParallel::registerDoParallel()
+
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = df_bs,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+xgb_res
+```
+
+
+
+```{r}
+collect_metrics(xgb_res)
+```
+
+```{r}
+# Use visualization to look at metrics
+
+# ROC AUC
+
+xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == 'roc_auc') %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               names_to = 'parameter',
+               values_to = 'value') %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = .8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = 'free_x') +
+  labs(x = '', y = 'AUC')
+```
+
+
+
+```{r}
+show_best(xgb_res, metric = 'roc_auc')
+```
+
+
+```{r}
+best_auc <- select_best(xgb_res, metric = 'roc_auc')
+```
+
+
+```{r}
+# Finalize workflow with best tuning parameters
+
+final_xgb <- finalize_workflow(
+  xgb_wf,
+  best_auc
+)
+
+final_xgb
+```
+
+
+```{r, warning = FALSE, message = FALSE}
+library(vip)
+
+# Fit to full training set and visualize importance
+
+final_xgb %>%
+  fit(data = df_train) %>%
+  pull_workflow_fit() %>%
+  vip(geom = 'point')
+```
+
+
+
+
+```{r}
+# Finally fit to the testing set
+
+final_res <- final_xgb %>%
+  last_fit(df_split)
+
+collect_metrics(final_res)
+```
+
+
+```{r}
+preds <- collect_predictions(final_res) %>%
+  select(-id, -.config)
+
+preds %>% slice(84:91)
+```
+
+
+```{r}
+preds %>%
+  filter(Personal.Loan == 'Yes') %>%
+  summarise(Min = min(.pred_No),
+            Q25 = quantile(.pred_No, .25),
+            Mean = mean(.pred_No),
+            Q75 = quantile(.pred_No, .75),
+            Max = max(.pred_No))
+
+```
+```{r}
+preds %>%
+  filter(Personal.Loan == 'No') %>%
+  summarise(Min = min(.pred_No),
+            Q25 = quantile(.pred_No, .25),
+            Mean = mean(.pred_No),
+            Q75 = quantile(.pred_No, .75),
+            Max = max(.pred_No))
+
+```
+
+
+```{r}
+preds <- preds %>%
+  mutate(
+    .pred_class = as_factor(ifelse(.pred_No > 0.866, 'No', 'Yes')),
+  )
+
+```
+
+```{r}
+# training metrics
+xgb_mets <- metric_set(accuracy, sensitivity, specificity)
+
+xgb_mets(preds, truth = Personal.Loan, estimate = .pred_class)
+```
+
+
+
+
+```{r}
+preds %>% 
+  conf_mat(truth = Personal.Loan, estimate = .pred_class) %>% 
+  autoplot(type = "heatmap")
+```
+
+
+
+```{r}
+fin_curve <- roc_curve(final_res %>% collect_predictions(), truth = Personal.Loan, .pred_No)
+
+autoplot(fin_curve)
+```
+
+
+```{r}
+fin_curve
+```
+
+
+
+
+
+
